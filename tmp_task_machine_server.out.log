@@ -1,0 +1,4 @@
+Общий журнал: C:\Users\PaHen\Documents\ChatGPT\Задание 21\logs\app.log
+Журнал ошибок: C:\Users\PaHen\Documents\ChatGPT\Задание 21\logs\errors.log
+ * Serving Flask app 'app'
+ * Debug mode: off

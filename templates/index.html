@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Локальный многодиалоговый агент DeepSeek">
   <title>DeepSeek Agent</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20260927-day20-1') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261003-day23') }}">
 </head>
 <body>
   <div class="app-shell">
@@ -19,6 +19,10 @@
       <div class="sidebar-create-actions">
         <button id="new-chat" class="primary" type="button">＋ Диалог</button>
         <button id="new-project" class="secondary" type="button">＋ Проект</button>
+      </div>
+      <div class="workspace-tabs" role="tablist" aria-label="Раздел приложения">
+        <button id="chat-view-button" class="workspace-tab active" type="button" role="tab" aria-selected="true">Чат</button>
+        <button id="rag-view-button" class="workspace-tab" type="button" role="tab" aria-selected="false">Управление RAG</button>
       </div>
       <form id="new-project-form" class="sidebar-project-form" hidden>
         <input id="new-project-name" maxlength="120" placeholder="Название проекта" required>
@@ -66,6 +70,14 @@
           </label>
           <button id="settings-toggle" class="secondary" type="button">Настройки запроса</button>
           <span id="settings-summary" class="settings-summary"></span>
+          <label class="rag-chat-toggle" title="Добавить найденные документальные чанки только к следующему сообщению"><input id="chat-rag-enabled" type="checkbox"><span>RAG</span></label>
+          <label class="rag-chat-toggle" title="Обязательные источники, дословные цитаты и отказ при слабой релевантности"><input id="chat-rag-verified" type="checkbox" disabled><span>Проверяемый</span></label>
+          <label class="rag-chat-option" title="Авто разделяет запросы к документам, Task State, MCP и общим знаниям; строгий режим разрешает только локальную базу">Маршрут<select id="chat-rag-routing"><option value="auto" selected>Авто</option><option value="strict">Только база</option></select></label>
+          <label class="rag-chat-option">Стратегия<select id="chat-rag-strategy"><option value="structural">Structural</option><option value="fixed">Fixed</option><option value="combined">Combined</option></select></label>
+          <label class="rag-chat-option">Улучшение<select id="chat-rag-mode"><option value="baseline">Без улучшений</option><option value="rewrite">Только rewrite</option><option value="filter">Только фильтр</option><option value="rerank">Только reranker</option><option value="combined" selected>Всё вместе</option></select></label>
+          <label class="rag-chat-option">До<input id="chat-rag-candidate-k" type="number" min="1" max="100" value="20"></label>
+          <label class="rag-chat-option">После<input id="chat-rag-final-k" type="number" min="1" max="20" value="5"></label>
+          <label class="rag-chat-option">Порог<input id="chat-rag-threshold" type="number" min="-1" max="1" step="0.01" value="0.83"></label>
           <span id="request-status" class="request-status" role="status" hidden><i></i> Запрос отправлен · ожидаем DeepSeek</span>
         </div>
         <form id="message-form" class="composer">
@@ -85,6 +97,18 @@
         <span id="context-status" class="context-status">Полная история</span>
       </div>
       <div class="context-scroll">
+        <section class="mcp-card mcp-master-card" aria-labelledby="mcp-control-title">
+          <div class="section-title">
+            <div><small>ОБЩИЙ ВЫКЛЮЧАТЕЛЬ</small><h3 id="mcp-control-title">Все MCP</h3></div>
+            <span id="mcp-control-status" class="mcp-status running">Разрешены</span>
+          </div>
+          <small>Принудительное отключение останавливает все MCP и запрещает их ручной и автоматический запуск, в том числе после перезапуска приложения.</small>
+          <div class="mcp-actions">
+            <button id="mcp-disable-all" class="danger" type="button">Отключить все MCP</button>
+            <button id="mcp-enable-all" class="secondary" type="button" disabled>Разрешить MCP</button>
+          </div>
+          <p id="mcp-control-message" class="mcp-message" role="status">MCP разрешены.</p>
+        </section>
         <section class="mcp-card" aria-labelledby="mediawiki-mcp-title">
           <div class="section-title">
             <div><small>ДЕНЬ 20</small><h3 id="mediawiki-mcp-title">MediaWiki MCP</h3></div>
@@ -150,6 +174,12 @@
             <div><small>ДЕНЬ 15</small><h3 id="task-state-title">Контролируемый жизненный цикл</h3></div>
             <span id="task-activity-badge" class="task-activity-badge">Активна</span>
           </div>
+          <small>Общий выключатель действует на все диалоги и сохраняется после перезапуска. Состояние задач при отключении не удаляется.</small>
+          <div class="task-control-actions">
+            <button id="task-control-disable" class="danger" type="button">Отключить машину задач</button>
+            <button id="task-control-enable" class="secondary" type="button" disabled>Включить машину задач</button>
+          </div>
+          <p id="task-control-message" class="task-control-message" role="status">Проверяем состояние машины задач…</p>
           <label>Описание задачи
             <textarea id="task-description" maxlength="2000" rows="2" placeholder="Что требуется сделать"></textarea>
           </label>
@@ -194,6 +224,22 @@
             <summary>История состояния (<span id="task-history-count">0</span>)</summary>
             <div id="task-history-list"></div>
           </details>
+        </section>
+        <section class="task-memory-card" aria-labelledby="task-memory-title">
+          <div class="section-title">
+            <div><small>ДЕНЬ 25</small><h3 id="task-memory-title">Память задачи</h3></div>
+            <span id="task-memory-status" class="task-memory-status">Выключена</span>
+          </div>
+          <label class="task-memory-toggle"><input id="task-memory-enabled" type="checkbox"> Автоматически вести память этого диалога</label>
+          <small id="task-memory-note">Хранит цель, уточнения, ограничения, термины, решения и открытые вопросы. Не переключает этапы Task State Machine.</small>
+          <div class="task-memory-fields">
+            <article><strong>Цель диалога</strong><p id="task-memory-goal">Пока не зафиксирована.</p></article>
+            <article><strong>Что пользователь уточнил</strong><ul id="task-memory-clarifications"></ul></article>
+            <article><strong>Ограничения</strong><ul id="task-memory-constraints"></ul></article>
+            <article><strong>Термины</strong><ul id="task-memory-terms"></ul></article>
+            <article><strong>Принятые решения</strong><ul id="task-memory-decisions"></ul></article>
+            <article><strong>Открытые вопросы</strong><ul id="task-memory-open-questions"></ul></article>
+          </div>
         </section>
         <section class="invariants-card" aria-labelledby="invariants-title">
           <div class="section-title"><div><small>ДЕНЬ 14</small><h3 id="invariants-title">Инварианты</h3></div><span id="invariants-count">0 активных</span></div>
@@ -264,6 +310,134 @@
       </div>
       <p class="context-foot">Полные сообщения, ветки, facts и версии summary сохраняются вместе в JSON диалога.</p>
     </aside>
+
+    <main id="rag-panel" class="rag-panel" hidden>
+      <header class="rag-header">
+        <div><small>ДЕНЬ 21</small><h1>Индексация документов</h1><p>Локальные чанки, эмбеддинги и сравнительный поиск без вызова DeepSeek.</p></div>
+        <span id="rag-header-status" class="rag-status idle">Индекс не построен</span>
+      </header>
+      <div class="rag-scroll">
+        <section class="rag-card rag-source-card">
+          <div class="rag-card-heading"><div><small>ИСТОЧНИКИ</small><h2>Папка документов</h2></div><button id="rag-refresh" class="secondary" type="button">Обновить список</button></div>
+          <code id="rag-folder" class="rag-folder"></code>
+          <p class="rag-help">Поддерживаются PDF с текстовым слоем, DOCX, TXT, Markdown и локальные HTML/HTM. Подкаталоги обходятся рекурсивно.</p>
+          <div id="rag-files" class="rag-file-list"></div>
+        </section>
+
+        <section class="rag-card rag-settings-card">
+          <div class="rag-card-heading"><div><small>ПАРАМЕТРЫ</small><h2>Chunking и эмбеддинги</h2></div><span id="rag-model" class="rag-model"></span></div>
+          <div class="rag-settings-grid">
+            <fieldset><legend>Fixed chunking</legend><label>Размер, токенов<input id="rag-fixed-size" type="number" min="32" max="500" value="350"></label><label>Overlap, токенов<input id="rag-fixed-overlap" type="number" min="0" max="499" value="50"></label></fieldset>
+            <fieldset><legend>Structural chunking</legend><label>Максимум, токенов<input id="rag-structural-size" type="number" min="32" max="500" value="350"></label><label>Overlap при делении<input id="rag-structural-overlap" type="number" min="0" max="499" value="50"></label></fieldset>
+          </div>
+          <button id="rag-build" class="primary rag-build" type="button">Построить оба индекса</button>
+          <p id="rag-build-note" class="rag-help">Модель запускается на CPU и загружается только при индексации или поиске.</p>
+        </section>
+
+        <section class="rag-card rag-progress-card">
+          <div class="rag-card-heading"><div><small>СОСТОЯНИЕ</small><h2 id="rag-progress-title">Индексация не запущена</h2></div><strong id="rag-progress-count">0 / 0</strong></div>
+          <div class="rag-progress"><span id="rag-progress-bar"></span></div>
+          <p id="rag-current-file" class="rag-help"></p>
+          <div id="rag-errors" class="rag-errors" hidden></div>
+        </section>
+
+        <section class="rag-comparison">
+          <article class="rag-card rag-strategy" data-strategy="fixed">
+            <div class="rag-card-heading"><div><small>СТРАТЕГИЯ 1</small><h2>Fixed</h2></div><span id="rag-fixed-total">0 чанков</span></div>
+            <div id="rag-fixed-stats" class="rag-stats"></div>
+            <label class="rag-source-filter">Документ<select id="rag-fixed-source"><option value="">Все документы</option></select></label>
+            <div id="rag-fixed-chunks" class="rag-chunk-list"></div>
+            <div class="rag-pagination"><button id="rag-fixed-prev" class="secondary" type="button">←</button><span id="rag-fixed-page">1</span><button id="rag-fixed-next" class="secondary" type="button">→</button></div>
+            <div id="rag-fixed-detail" class="rag-chunk-detail"><p>Выберите чанк, чтобы увидеть текст и метаданные.</p></div>
+          </article>
+          <article class="rag-card rag-strategy" data-strategy="structural">
+            <div class="rag-card-heading"><div><small>СТРАТЕГИЯ 2</small><h2>Structural</h2></div><span id="rag-structural-total">0 чанков</span></div>
+            <div id="rag-structural-stats" class="rag-stats"></div>
+            <label class="rag-source-filter">Документ<select id="rag-structural-source"><option value="">Все документы</option></select></label>
+            <div id="rag-structural-chunks" class="rag-chunk-list"></div>
+            <div class="rag-pagination"><button id="rag-structural-prev" class="secondary" type="button">←</button><span id="rag-structural-page">1</span><button id="rag-structural-next" class="secondary" type="button">→</button></div>
+            <div id="rag-structural-detail" class="rag-chunk-detail"><p>Выберите чанк, чтобы увидеть текст и метаданные.</p></div>
+          </article>
+        </section>
+
+        <section class="rag-card rag-search-card">
+          <div class="rag-card-heading"><div><small>СЕМАНТИЧЕСКИЙ ПОИСК</small><h2>Сравнить два индекса</h2></div><span>DeepSeek не вызывается</span></div>
+          <form id="rag-search-form" class="rag-search-form">
+            <input id="rag-search-query" maxlength="2000" placeholder="Введите вопрос или поисковую фразу" required>
+            <label>Top-K<input id="rag-search-top-k" type="number" min="1" max="50" value="5"></label>
+            <button class="primary" type="submit">Найти в обоих индексах</button>
+          </form>
+          <p id="rag-search-message" class="rag-help"></p>
+          <div class="rag-search-results"><div><h3>Fixed</h3><div id="rag-fixed-results"></div></div><div><h3>Structural</h3><div id="rag-structural-results"></div></div></div>
+        </section>
+
+        <section class="rag-card rag-answer-card">
+          <div class="rag-card-heading"><div><small>ДЕНЬ 22</small><h2>Ответ без RAG и с RAG</h2></div><span>2 вызова DeepSeek</span></div>
+          <p class="rag-help">Сравнение не добавляет сообщения в диалог. Настройки модели и текущий контекст берутся из активного диалога, результат сохраняется отдельно.</p>
+          <form id="rag-compare-form" class="rag-compare-form">
+            <label>Контрольный вопрос<select id="rag-control-question"><option value="">Свой вопрос</option></select></label>
+            <textarea id="rag-compare-question" maxlength="50000" rows="4" placeholder="Введите вопрос для двух режимов" required></textarea>
+            <div class="rag-compare-settings">
+              <label>Стратегия<select id="rag-compare-strategy"><option value="structural">Structural</option><option value="fixed">Fixed</option><option value="combined">Combined</option></select></label>
+              <label>Top-K<input id="rag-compare-top-k" type="number" min="1" max="20" value="5"></label>
+              <button id="rag-compare-submit" class="primary" type="submit">Сравнить ответы</button>
+            </div>
+          </form>
+          <div id="rag-control-expectation" class="rag-expectation" hidden></div>
+          <p id="rag-compare-message" class="rag-help"></p>
+          <div class="rag-answer-results">
+            <article><header><h3>Без RAG</h3><span id="rag-without-usage"></span></header><div id="rag-without-answer" class="rag-answer-text"></div></article>
+            <article><header><h3>С RAG</h3><span id="rag-with-usage"></span></header><div id="rag-with-answer" class="rag-answer-text"></div></article>
+          </div>
+          <details class="rag-retrieved"><summary>Чанки, переданные модели</summary><div id="rag-compare-sources"></div></details>
+        </section>
+
+        <section class="rag-card rag-answer-card rag-day23-card">
+          <div class="rag-card-heading"><div><small>ДЕНЬ 23</small><h2>Сравнить способы улучшения RAG</h2></div><span>5 ответов + 1 rewrite</span></div>
+          <p class="rag-help">Один вопрос проходит пятью путями: baseline, только query rewrite, только similarity-фильтр, только локальный reranker и всё вместе. Результаты не добавляются в диалог.</p>
+          <form id="rag-pipeline-form" class="rag-compare-form">
+            <label>Контрольный вопрос<select id="rag-pipeline-question"><option value="">Свой вопрос</option></select></label>
+            <textarea id="rag-pipeline-text" maxlength="50000" rows="4" placeholder="Введите вопрос для пяти режимов" required></textarea>
+            <div class="rag-pipeline-settings">
+              <label>Стратегия<select id="rag-pipeline-strategy"><option value="combined">Combined</option><option value="structural">Structural</option><option value="fixed">Fixed</option></select></label>
+              <label>Top-K до<input id="rag-pipeline-candidate-k" type="number" min="1" max="100" value="20"></label>
+              <label>Top-K после<input id="rag-pipeline-final-k" type="number" min="1" max="20" value="5"></label>
+              <label>Similarity<input id="rag-pipeline-threshold" type="number" min="-1" max="1" step="0.01" value="0.83"></label>
+              <button id="rag-pipeline-submit" class="primary" type="submit">Сравнить 5 режимов</button>
+            </div>
+          </form>
+          <div id="rag-pipeline-expectation" class="rag-expectation" hidden></div>
+          <p id="rag-pipeline-message" class="rag-help"></p>
+          <p id="rag-rewrite-result" class="rag-rewrite-result" hidden></p>
+          <div id="rag-pipeline-results" class="rag-pipeline-results"></div>
+        </section>
+
+        <section class="rag-card rag-answer-card rag-day24-card">
+          <div class="rag-card-heading"><div><small>ДЕНЬ 24</small><h2>Источники, цитаты и «не знаю»</h2></div><span>ответ + LLM-проверка</span></div>
+          <p class="rag-help">Combined-поиск сначала проходит локальный порог. При слабой релевантности DeepSeek для ответа не вызывается. Иначе приложение проверяет source, section, chunk_id и дословность каждой цитаты, затем отдельный LLM-вызов оценивает смысловую подтверждённость.</p>
+          <form id="rag-evidence-form" class="rag-compare-form">
+            <label>Контрольный вопрос<select id="rag-evidence-question"><option value="">Свой вопрос</option></select></label>
+            <textarea id="rag-evidence-text" maxlength="50000" rows="4" placeholder="Введите вопрос для проверяемого RAG" required></textarea>
+            <div class="rag-pipeline-settings">
+              <label>Стратегия<select id="rag-evidence-strategy"><option value="combined">Combined</option><option value="structural">Structural</option><option value="fixed">Fixed</option></select></label>
+              <label>Top-K до<input id="rag-evidence-candidate-k" type="number" min="1" max="100" value="20"></label>
+              <label>Top-K после<input id="rag-evidence-final-k" type="number" min="1" max="20" value="5"></label>
+              <label>Similarity<input id="rag-evidence-threshold" type="number" min="-1" max="1" step="0.01" value="0.83"></label>
+              <button id="rag-evidence-submit" class="primary" type="submit">Проверить ответ</button>
+            </div>
+          </form>
+          <div id="rag-evidence-expectation" class="rag-expectation" hidden></div>
+          <p id="rag-evidence-message" class="rag-help"></p>
+          <div id="rag-evidence-result" class="rag-evidence-result"></div>
+        </section>
+
+        <section class="rag-card">
+          <div class="rag-card-heading"><div><small>КОНТРОЛЬНЫЙ НАБОР</small><h2>15 вопросов и сохранённые прогоны</h2></div><span id="rag-evaluation-count">0 прогонов</span></div>
+          <div id="rag-control-list" class="rag-control-list"></div>
+          <details><summary>История сравнений</summary><div id="rag-evaluation-history" class="rag-evaluation-history"></div></details>
+        </section>
+      </div>
+    </main>
 
     <aside id="settings-panel" class="settings-panel" aria-label="Настройки запроса">
       <div class="panel-heading"><div><small>ДЛЯ СЛЕДУЮЩЕГО ЗАПРОСА</small><h2>Настройки агента</h2></div><button id="settings-close" class="icon-button">×</button></div>
@@ -496,6 +670,6 @@
   <template id="message-template">
     <article class="message"><div class="message-avatar"></div><div class="message-body"><header><strong></strong><time></time></header><div class="message-text"></div><div class="message-actions"><button class="fork-button" type="button">Разветвить</button><button class="policy-retry-button" type="button" hidden>Сгенерировать заново</button><button class="memory-used-button" type="button" hidden>Какая память использована</button><div class="branch-switch" hidden><button class="branch-prev" type="button" aria-label="Предыдущая ветка">‹</button><span></span><button class="branch-next" type="button" aria-label="Следующая ветка">›</button></div></div><div class="token-strip" hidden></div><details class="reasoning" hidden><summary>Ход рассуждений</summary><div></div></details><details class="technical"><summary>Техническая информация</summary><pre></pre></details></div></article>
   </template>
-  <script src="{{ url_for('static', filename='app.js', v='20260927-day20-1') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='20261003-day23') }}"></script>
 </body>
 </html>

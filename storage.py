@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from task_state import ensure_task_state, initial_task_state
+from task_memory import ensure_task_memory, initial_task_memory
 
 
 logger = logging.getLogger("deepseek_agent.storage")
@@ -135,6 +136,8 @@ class JsonStorage:
             "project_id": project_id,
             "owner_profile_id": owner_profile_id,
             "task_state": initial_task_state(timestamp),
+            "task_memory": initial_task_memory(timestamp),
+            "task_memory_revisions": [],
             "task_handoffs": [],
             "artifacts": [],
             "messages": [],
@@ -185,6 +188,7 @@ class JsonStorage:
             if isinstance(message, dict) and message.get("role") == "user":
                 message.setdefault("author_profile_id", default_profile_id)
         conversation.setdefault("memory_extraction_revisions", [])
+        ensure_task_memory(conversation)
         conversation["task_handoffs"] = conversation.get("task_handoffs") if isinstance(conversation.get("task_handoffs"), list) else []
         conversation["artifacts"] = conversation.get("artifacts") if isinstance(conversation.get("artifacts"), list) else []
         ensure_task_state(conversation)
@@ -196,6 +200,7 @@ class JsonStorage:
         saved = deepcopy(conversation)
         saved["schema_version"] = 3
         saved.setdefault("owner_profile_id", self.default_profile_id())
+        ensure_task_memory(saved)
         saved["task_handoffs"] = saved.get("task_handoffs") if isinstance(saved.get("task_handoffs"), list) else []
         saved["artifacts"] = saved.get("artifacts") if isinstance(saved.get("artifacts"), list) else []
         ensure_task_state(saved)

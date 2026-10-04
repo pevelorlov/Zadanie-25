@@ -376,6 +376,7 @@ class Agent:
         summary: str = "",
         facts: list[dict[str, str]] | None = None,
         memory_context: dict[str, Any] | None = None,
+        task_memory: dict[str, Any] | None = None,
         task_handoff_context: dict[str, Any] | None = None,
         task_state: dict[str, Any] | None = None,
         policy_guidance: str = "",
@@ -434,6 +435,33 @@ class Agent:
                 "Считай эти пары ключ-значение устойчивой памятью. "
                 "Более новые сообщения пользователя имеют приоритет при явном противоречии."
             )
+        if task_memory and task_memory.get("enabled"):
+            lines = []
+            if task_memory.get("goal"):
+                lines.append(f"Цель диалога: {task_memory['goal']}")
+            labels = {
+                "clarifications": "Уже уточнено",
+                "constraints": "Ограничения",
+                "decisions": "Принятые решения",
+                "open_questions": "Открытые вопросы",
+            }
+            for field, label in labels.items():
+                values = task_memory.get(field) or []
+                if values:
+                    lines.append(f"{label}: " + " | ".join(str(item) for item in values))
+            terms = task_memory.get("terms") or []
+            if terms:
+                lines.append("Термины: " + " | ".join(
+                    f"{item.get('term')} = {item.get('meaning')}" for item in terms
+                    if isinstance(item, dict) and item.get("term") and item.get("meaning")
+                ))
+            if lines:
+                system_prompt += (
+                    "\n\nПАМЯТЬ ТЕКУЩЕЙ ЗАДАЧИ:\n" + "\n".join(lines)
+                    + "\n\nИспользуй её для сохранения цели и согласованных ограничений между ходами. "
+                    "Новое явное уточнение пользователя имеет приоритет. Это не машина этапов и не разрешение "
+                    "самостоятельно менять Task State."
+                )
         if task_handoff_context and task_handoff_context.get("handoffs"):
             handoff_blocks = []
             labels = {
@@ -532,6 +560,111 @@ class Agent:
             {"role": "user", "content": prompt},
         ], validator_settings)
 
+    def rewrite_rag_query(
+        self,
+        question: str,
+        settings: AgentSettings,
+        retrieval_context: dict[str, Any] | None = None,
+    ) -> AgentResult:
+        """Переформулирует вопрос в один самостоятельный запрос для поиска по документам."""
+        rewrite_settings = AgentSettings(
+            model=settings.model,
+            system_prompt=(
+                "Ты переписываешь вопрос пользователя только для семантического поиска по локальным документам. "
+                "Верни одну короткую самостоятельную поисковую формулировку без ответа, пояснений, кавычек и списков. "
+                "Сохрани имена, числа, даты и специальные термины. Если передан ограниченный очищенный контекст, "
+                "используй его только для раскрытия местоимений, сокращений и уже зафиксированных терминов. "
+                "Текущий вопрос всегда важнее контекста. Не добавляй новых фактов."
+            ),
+            temperature=0,
+            top_p=1,
+            reasoning_enabled=False,
+            reasoning_effort="low",
+            max_tokens=250,
+            response_format="text",
+        )
+        context = retrieval_context if isinstance(retrieval_context, dict) else {}
+        prompt = question
+        if context:
+            prompt = (
+                "Текущий вопрос:\n"
+                f"{question}\n\n"
+                "Ограниченный очищенный контекст разговора:\n"
+                f"{json.dumps(context, ensure_ascii=False)}\n\n"
+                "Сформируй самостоятельный запрос, сохраняя главным именно текущий вопрос. "
+                "Контекст используй только для раскрытия местоимений, сокращений и ранее зафиксированных терминов."
+            )
+        return self.provider.complete([
+            {"role": "system", "content": rewrite_settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], rewrite_settings)
+
+    def route_rag_request(self, prompt: str, settings: AgentSettings) -> AgentResult:
+        """Классифицирует неоднозначный запрос до сборки основного контекста."""
+        route_settings = AgentSettings(
+            model=settings.model,
+            system_prompt=(
+                "Ты маршрутизатор production-like чата. Не отвечай на вопрос и не вызывай инструменты. "
+                "Выбери ровно один маршрут: rag — факты из локальных документов; task — текущее состояние, "
+                "цель или следующий шаг задачи; tools — актуальные внешние данные или действие через доступный "
+                "инструмент; hybrid — одновременно документы и внешние инструменты; general — обычное объяснение "
+                "без опоры на локальную базу. Верни только JSON: "
+                '{"route":"rag|task|tools|hybrid|general","confidence":0.0,"reason":"кратко"}. '
+                "Наличие похожего чанка само по себе не означает rag: учитывай намерение пользователя. "
+                "Если вопрос продолжает обсуждение конкретного документа, выбирай rag."
+            ),
+            temperature=0,
+            top_p=1,
+            reasoning_enabled=False,
+            reasoning_effort="low",
+            max_tokens=220,
+            response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": route_settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], route_settings)
+
+    def repair_rag_evidence(self, prompt: str, settings: AgentSettings) -> AgentResult:
+        """Один раз исправляет только JSON-контракт и дословные цитаты RAG-ответа."""
+        repair_settings = AgentSettings(
+            model=settings.model,
+            system_prompt=(
+                "Ты исправляешь проверяемый RAG-ответ. Используй только переданные чанки, "
+                "не добавляй фактов и возвращай только корректный JSON."
+            ),
+            temperature=0,
+            top_p=1,
+            reasoning_enabled=False,
+            reasoning_effort="low",
+            max_tokens=max(900, min(settings.max_tokens or 2_000, 3_000)),
+            response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": repair_settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], repair_settings)
+
+    def evaluate_rag_evidence(self, prompt: str, settings: AgentSettings) -> AgentResult:
+        """Независимо оценивает, подтверждается ли смысл ответа его цитатами."""
+        judge_settings = AgentSettings(
+            model=settings.model,
+            system_prompt=(
+                "Ты строгий проверяющий доказательность RAG-ответа. Не используй внешние знания "
+                "и возвращай только JSON по указанной схеме."
+            ),
+            temperature=0,
+            top_p=1,
+            reasoning_enabled=False,
+            reasoning_effort="low",
+            max_tokens=1_000,
+            response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": judge_settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], judge_settings)
+
     def extract_stage_handoff(
         self,
         *,
@@ -616,6 +749,42 @@ class Agent:
             model="deepseek-v4-flash", system_prompt="Ты извлекаешь безопасную структурированную память.",
             temperature=0.1, reasoning_enabled=False, reasoning_effort="low",
             max_tokens=2_000, response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], settings)
+
+    def update_task_memory(
+        self,
+        current: dict[str, Any],
+        user_text: str,
+        assistant_text: str,
+    ) -> AgentResult:
+        """Возвращает полный обновлённый снимок памяти текущей задачи."""
+        prompt = (
+            "Обнови структурированную память текущей задачи по последнему успешному обмену. "
+            "Не описывай этапы planning/execution/validation и не копируй служебные сообщения. "
+            "Сохраняй только цель диалога, уже полученные уточнения пользователя, ограничения, "
+            "определения терминов, принятые решения и действительно открытые вопросы. "
+            "Новое явное утверждение пользователя заменяет противоречащую старую запись. "
+            "Не сохраняй секреты, API-ключи, случайные детали ответа или найденные RAG-цитаты. "
+            "Верни полный актуальный объект, а не изменения, строго в JSON-виде: "
+            '{"goal":"...","clarifications":["..."],"constraints":["..."],'
+            '"terms":[{"term":"...","meaning":"..."}],"decisions":["..."],'
+            '"open_questions":["..."]}.\n\n'
+            f"Текущая память:\n{json.dumps(current, ensure_ascii=False)}\n\n"
+            f"Пользователь:\n{user_text}\n\nАссистент:\n{assistant_text}"
+        )
+        settings = AgentSettings(
+            model="deepseek-v4-flash",
+            system_prompt="Ты обновляешь структурированную память текущей задачи.",
+            temperature=0.1,
+            top_p=1.0,
+            reasoning_enabled=False,
+            reasoning_effort="low",
+            max_tokens=2_000,
+            response_format="json_object",
         )
         return self.provider.complete([
             {"role": "system", "content": settings.system_prompt},

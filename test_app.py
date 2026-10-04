@@ -22,13 +22,15 @@ from agent import (
 )
 from artifacts import ArtifactError, extract_artifact_payloads, normalize_artifact_path
 import app as app_module
-from app import create_app, friendly_api_error
+from app import create_app, deterministic_auto_route, friendly_api_error, requests_outside_rag, strip_rag_evidence_appendix
 from context_manager import completed_exchanges, ensure_context_management, summary_token_totals
+from document_index.embeddings import SentenceTransformerEmbedder
 from main import find_available_port
 from logging_setup import BACKUP_COUNT, MAX_LOG_BYTES, configure_logging
 from presets import PresetManager
 from storage import JsonStorage
 from task_policy import PolicyValidationError, generation_guidance, parse_validation_result, policy_context
+from task_memory import apply_task_memory_result, ensure_task_memory, update_task_memory_settings
 from task_state import (
     TaskTransitionError,
     allowed_task_events,
@@ -54,7 +56,26 @@ class FakeProvider:
         if self.fail:
             raise RuntimeError("Connection error")
         system = messages[0]["content"]
-        if "ОГРАНИЧЕНИЯ КОНТРОЛИРУЕМОГО ОТВЕТА" in system:
+        if "строгий проверяющий доказательность RAG-ответа" in system:
+            content = json.dumps({
+                "meaning_supported": True, "unsupported_claims": [],
+                "notes": "Все утверждения подтверждены цитатами.",
+            }, ensure_ascii=False)
+        elif "маршрутизатор production-like чата" in system:
+            content = json.dumps({
+                "route": "rag", "confidence": 0.9,
+                "reason": "Вопрос относится к локальным документам.",
+            }, ensure_ascii=False)
+        elif "исправляешь проверяемый RAG-ответ" in system or "ПРОВЕРЯЕМЫЙ RAG" in system:
+            content = json.dumps({
+                "status": "answer",
+                "answer": "Точный факт подтверждён документом [1].",
+                "citations": [{
+                    "ref": 1, "chunk_id": "chunk-test",
+                    "quote": "Точный факт из локального документа.",
+                }],
+            }, ensure_ascii=False)
+        elif "ОГРАНИЧЕНИЯ КОНТРОЛИРУЕМОГО ОТВЕТА" in system:
             content = "Тестовый ответ"
         elif "строгий контроллер этапов" in system:
             context = json.loads(messages[-1]["content"].rsplit("Политика:\n", 1)[1])
@@ -77,6 +98,15 @@ class FakeProvider:
             }, ensure_ascii=False)
         elif "обновляешь точную структурированную память" in system:
             content = '{"facts":[{"key":"preferences.language","value":"Русский"}]}'
+        elif "обновляешь структурированную память текущей задачи" in system:
+            content = json.dumps({
+                "goal": "Подготовить демонстрацию RAG-чата",
+                "clarifications": ["Память должна быть видна в интерфейсе"],
+                "constraints": ["Task State Machine не обязательна"],
+                "terms": [{"term": "память задачи", "meaning": "структурированный снимок цели диалога"}],
+                "decisions": ["Хранить память отдельно от истории сообщений"],
+                "open_questions": [],
+            }, ensure_ascii=False)
         else:
             content = '{"facts":[]}' if settings.response_format == "json_object" else "Тестовый ответ"
         return AgentResult(
@@ -99,6 +129,83 @@ class FakeProvider:
                 "settings": settings.to_dict(),
             },
         )
+
+
+class FakeRagIndexService:
+    def __init__(self):
+        self.retrieve_calls = []
+        self.pipeline_calls = []
+        self.conversational_calls = []
+        self.augment_calls = []
+
+    def state(self):
+        return {
+            "documents_dir": "test-rag-documents", "supported_extensions": [".pdf"],
+            "files": [], "file_count": 0, "job": {"running": False, "phase": "idle"},
+            "latest_run": {"id": "run-test"}, "sources": ["source.pdf"], "model_name": "fake", "reranker_model_name": "fake-reranker",
+        }
+
+    def start_build(self, settings):
+        return {"running": True, "phase": "queued"}
+
+    def list_chunks(self, strategy, page=1, page_size=20, source=""):
+        return {"items": [], "total": 0, "page": page, "page_size": page_size, "run_id": "run-test"}
+
+    def search(self, query, top_k):
+        return {"query": query, "top_k": int(top_k), "run_id": "run-test", "results": {"fixed": [], "structural": []}}
+
+    def retrieve(self, query, strategy="structural", top_k=5):
+        self.retrieve_calls.append((query, strategy, int(top_k)))
+        return {
+            "query": query, "strategy": strategy, "top_k": int(top_k), "run_id": "run-test",
+            "chunks": [{
+                "chunk_id": "chunk-test", "strategy": "structural", "source": "source.pdf",
+                "title": "Источник", "section": "Раздел", "page": 3, "chunk_order": 0,
+                "token_count": 12, "text": "Точный факт из локального документа.",
+                "text_hash": "hash-test", "score": 0.91,
+            }],
+        }
+
+    def retrieve_pipeline(self, query, *, strategy, mode, candidate_k, final_k, similarity_threshold, rewritten_query=None):
+        self.pipeline_calls.append((query, strategy, mode, candidate_k, final_k, similarity_threshold, rewritten_query))
+        result = self.retrieve(query, strategy, final_k)
+        result.update({
+            "search_query": rewritten_query or query,
+            "mode": mode,
+            "candidate_k": candidate_k,
+            "final_k": final_k,
+            "similarity_threshold": similarity_threshold,
+            "candidate_count": candidate_k,
+            "after_filter_count": final_k,
+        })
+        if mode in {"rerank", "combined"}:
+            result["chunks"][0]["reranker_score"] = 0.87
+        return result
+
+    def retrieve_conversational(self, query, contextual_query, *, strategy, candidate_k, final_k, similarity_threshold, direct_weight=0.7):
+        self.conversational_calls.append((query, contextual_query, strategy, candidate_k, final_k, similarity_threshold, direct_weight))
+        result = self.retrieve(query, strategy, final_k)
+        result.update({
+            "search_query": contextual_query, "direct_query": query, "contextual_query": contextual_query,
+            "mode": "combined", "candidate_k": candidate_k, "final_k": final_k,
+            "similarity_threshold": similarity_threshold, "candidate_count": candidate_k,
+            "after_filter_count": final_k, "direct_weight": direct_weight,
+            "context_weight": 1 - direct_weight,
+        })
+        score = float(result["chunks"][0]["score"])
+        result["chunks"][0].update({
+            "direct_score": score, "context_score": score, "fusion_score": 0.95, "reranker_score": 0.87,
+            "channel_gate_passed": score >= similarity_threshold,
+        })
+        return result
+
+    def augment_with_chunk_ids(self, query, retrieval, chunk_ids, *, final_k):
+        self.augment_calls.append((query, list(chunk_ids), final_k))
+        result = deepcopy(retrieval)
+        result["ledger_candidate_count"] = len(chunk_ids)
+        if result.get("chunks"):
+            result["chunks"][0]["ledger_reused"] = True
+        return result
 
 
 class ToolAwareFakeProvider(FakeProvider):
@@ -329,6 +436,32 @@ class AutopilotProvider(FakeProvider):
                 "recommended_event": event,
                 "explanation": "",
             }, ensure_ascii=False), "", super().complete(messages, settings).technical)
+        return super().complete(messages, settings)
+
+
+class ExplicitApprovalStallProvider(FakeProvider):
+    """Имитирует наблюдавшийся сбой: валидатор не замечает явное утверждение плана."""
+
+    def complete(self, messages, settings):
+        system = messages[0]["content"]
+        if "строгий контроллер этапов" in system:
+            self.calls.append((messages, settings))
+            context = json.loads(messages[-1]["content"].rsplit("Политика:\n", 1)[1])
+            approved = "План утверждаю" in messages[-1]["content"]
+            return AgentResult(json.dumps({
+                "allowed": True,
+                "detected_action_type": "clarification" if approved else "planning",
+                "checked_invariant_ids": [item["ref"] for item in context["invariants"]],
+                "violated_invariant_ids": [],
+                "stage_complete": False,
+                "recommended_event": None,
+                "required_artifacts": [] if approved else ["portfolio.md"],
+                "explanation": "",
+            }, ensure_ascii=False), "", super().complete(messages, settings).technical)
+        if "ОГРАНИЧЕНИЯ КОНТРОЛИРУЕМОГО ОТВЕТА" in system:
+            result = super().complete(messages, settings)
+            content = "Утверждение принято." if "План утверждаю" in messages[-1]["content"] else "План готов. Утвердите его."
+            return AgentResult(content, result.reasoning_content, result.technical)
         return super().complete(messages, settings)
 
 
@@ -1060,6 +1193,34 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(ensure_task_state(restored)["stage"], "planning")
             self.assertEqual(restored["task_state"]["activity"], "active")
 
+    def test_task_memory_defaults_are_added_to_legacy_conversation(self):
+        conversation = {"messages": []}
+        memory = ensure_task_memory(conversation)
+        self.assertFalse(memory["enabled"])
+        self.assertEqual(memory["goal"], "")
+        self.assertEqual(conversation["task_memory_revisions"], [])
+
+    def test_task_memory_result_replaces_snapshot_and_keeps_toggle(self):
+        conversation = {"messages": []}
+        update_task_memory_settings(conversation, {"enabled": True})
+        result = AgentResult(
+            content=json.dumps({
+                "goal": "Собрать отчёт",
+                "clarifications": ["На русском"],
+                "constraints": ["Только локально"],
+                "terms": [{"term": "RAG", "meaning": "поиск по документам"}],
+                "decisions": [],
+                "open_questions": ["Какой формат?"],
+            }, ensure_ascii=False),
+            reasoning_content="",
+            technical={"usage": {"total_tokens": 12}},
+        )
+        revision = apply_task_memory_result(conversation, result, "exchange-1")
+        self.assertEqual(revision["status"], "completed")
+        self.assertTrue(conversation["task_memory"]["enabled"])
+        self.assertEqual(conversation["task_memory"]["goal"], "Собрать отчёт")
+        self.assertEqual(conversation["task_memory"]["revision"], 1)
+
     def test_legacy_branching_mode_migrates_to_full_without_losing_tree_state(self):
         conversation = {
             "messages": [{"id": "root", "role": "user", "content": "Тест", "parent_id": None}],
@@ -1098,6 +1259,24 @@ class ApiTests(unittest.TestCase):
     def create_conversation(self):
         return self.client.post("/api/conversations", json={"title": "Новый диалог"}).get_json()["conversation"]
 
+    def test_embedding_model_uses_local_cache_before_network_fallback(self):
+        model = SimpleNamespace()
+        calls = []
+
+        def constructor(name, **kwargs):
+            calls.append((name, deepcopy(kwargs)))
+            return model
+
+        fake_module = SimpleNamespace(SentenceTransformer=constructor)
+        with mock.patch.dict("sys.modules", {"sentence_transformers": fake_module}):
+            embedder = SentenceTransformerEmbedder("test/model")
+            self.assertIs(embedder.model, model)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "test/model")
+        self.assertEqual(calls[0][1]["device"], "cpu")
+        self.assertIs(calls[0][1]["local_files_only"], True)
+
     def test_index_is_chat_not_temperature_lab(self):
         text = self.client.get("/").get_data(as_text=True)
         self.assertIn("DeepSeek Agent", text)
@@ -1116,12 +1295,32 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="task-state-show"', text)
         self.assertIn('id="task-transition-mode"', text)
         self.assertIn('id="task-autopilot-stop"', text)
+        self.assertIn('id="task-control-disable"', text)
+        self.assertIn('id="task-control-enable"', text)
+        self.assertIn('id="task-memory-enabled"', text)
+        self.assertIn('id="task-memory-goal"', text)
         self.assertNotIn("Свободные этапы · День 13", text)
         self.assertIn('id="invariants-title"', text)
         self.assertIn('id="invariant-scope"', text)
+        self.assertIn('id="rag-view-button"', text)
+        self.assertIn('id="rag-panel"', text)
+        self.assertIn("Построить оба индекса", text)
+        self.assertIn("Найти в обоих индексах", text)
+        self.assertIn('id="chat-rag-enabled"', text)
+        self.assertIn('id="rag-compare-form"', text)
+        self.assertIn('id="rag-pipeline-form"', text)
+        self.assertIn('id="chat-rag-verified"', text)
+        self.assertIn('id="chat-rag-routing"', text)
+        self.assertIn('<option value="auto" selected>Авто</option>', text)
+        self.assertIn('id="rag-evidence-form"', text)
+        self.assertIn('id="chat-rag-candidate-k"', text)
+        self.assertIn('id="chat-rag-final-k"', text)
+        self.assertIn("Ответ без RAG и с RAG", text)
         self.assertIn('id="mcp-start"', text)
         self.assertIn('id="mcp-tools"', text)
         self.assertIn('id="mcp-stop"', text)
+        self.assertIn('id="mcp-disable-all"', text)
+        self.assertIn('id="mcp-enable-all"', text)
         self.assertIn('id="weather-mcp-start"', text)
         self.assertIn("Open‑Meteo MCP", text)
         self.assertIn("только папку проекта <code>workspace</code>", text)
@@ -1129,6 +1328,531 @@ class ApiTests(unittest.TestCase):
         self.assertIn("preferences.language", text)
         self.assertNotIn("Запустить 3 температуры", text)
         self.assertNotIn('id="message-input" maxlength="50000" rows="1" placeholder="Напишите сообщение…" required', text)
+
+    def test_task_memory_is_per_dialog_updated_and_injected_into_next_reply(self):
+        conversation = self.create_conversation()
+        endpoint = f"/api/conversations/{conversation['id']}"
+        disabled = self.client.post("/api/task-control/disable", json={})
+        self.assertEqual(disabled.status_code, 200)
+        enabled = self.client.patch(f"{endpoint}/task-memory", json={"enabled": True})
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(enabled.get_json()["conversation"]["task_memory"]["enabled"])
+
+        first = self.client.post(f"{endpoint}/messages", json={
+            "content": "Нужно подготовить демонстрацию RAG-чата.",
+            "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(first.status_code, 200)
+        first_conversation = first.get_json()["conversation"]
+        self.assertEqual(first_conversation["task_memory"]["goal"], "Подготовить демонстрацию RAG-чата")
+        self.assertEqual(first_conversation["task_memory"]["revision"], 1)
+        self.assertEqual(len(first_conversation["task_memory_revisions"]), 1)
+        self.assertEqual(first_conversation["task_memory_token_totals"]["total_tokens"], 30)
+
+        second = self.client.post(f"{endpoint}/messages", json={
+            "content": "Какие ограничения мы уже зафиксировали?",
+            "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(second.status_code, 200)
+        system_prompts = [call[0][0]["content"] for call in self.provider.calls if call[0]]
+        self.assertTrue(any(
+            "ПАМЯТЬ ТЕКУЩЕЙ ЗАДАЧИ" in prompt
+            and "Цель диалога: Подготовить демонстрацию RAG-чата" in prompt
+            for prompt in system_prompts
+        ))
+
+    def test_rag_state_and_empty_index_endpoints_are_local(self):
+        state = self.client.get("/api/rag/state")
+        self.assertEqual(state.status_code, 200)
+        payload = state.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["files"], [])
+        self.assertIn(".docx", payload["supported_extensions"])
+        self.assertTrue(Path(payload["documents_dir"]).is_dir())
+        chunks = self.client.get("/api/rag/chunks?strategy=fixed")
+        self.assertEqual(chunks.status_code, 200)
+        self.assertEqual(chunks.get_json()["items"], [])
+        search = self.client.post("/api/rag/search", json={"query": "тест", "top_k": 5})
+        self.assertEqual(search.status_code, 409)
+        self.assertIn("постройте индекс", search.get_json()["error"].lower())
+
+    def test_chat_rag_toggle_adds_chunks_and_request_snapshot(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "rag-chat", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "RAG"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {"enabled": True, "strategy": "combined", "top_k": 5},
+        })
+        self.assertEqual(response.status_code, 200)
+        saved = response.get_json()["conversation"]["messages"]
+        user = next(item for item in saved if item["role"] == "user")
+        assistant = next(item for item in saved if item["role"] == "assistant")
+        self.assertTrue(user["technical"]["rag"]["enabled"])
+        self.assertEqual(user["technical"]["rag"]["chunks"][0]["source"], "source.pdf")
+        self.assertEqual(assistant["technical"]["rag"]["strategy"], "combined")
+        self.assertEqual(rag.retrieve_calls, [("Какой точный факт указан в документе?", "combined", 5)])
+        generation = policy_generation_calls(provider)[0][0][0]["content"]
+        self.assertIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", generation)
+        self.assertIn("Точный факт из локального документа", generation)
+
+    def test_chat_without_rag_preserves_previous_prompt(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "no-rag-chat", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Без RAG"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Обычный вопрос", "settings": AgentSettings().to_dict(),
+            "rag": {"enabled": False, "strategy": "structural", "top_k": 5},
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(rag.retrieve_calls, [])
+        generation = policy_generation_calls(provider)[0][0][0]["content"]
+        self.assertNotIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", generation)
+
+    def test_auto_routing_answers_task_state_without_strict_document_evidence(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "auto-task", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Автомаршрут"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Что мы сейчас делаем и какой следующий шаг?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "routing_mode": "auto",
+                "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        snapshot = assistant["technical"]["rag"]
+        self.assertEqual(snapshot["routing"]["route"], "task")
+        self.assertEqual(len(rag.retrieve_calls), 1)
+        self.assertEqual(rag.pipeline_calls, [])
+        self.assertNotIn("Цитаты:", assistant["content"])
+        self.assertIn("Task State текущего диалога", assistant["content"])
+        generation = policy_generation_calls(provider)[0][0][0]["content"]
+        self.assertIn("АВТОМАРШРУТ TASK STATE", generation)
+        self.assertNotIn("ПРОВЕРЯЕМЫЙ RAG", generation)
+
+    def test_automatic_task_continuation_inherits_document_requirement(self):
+        rag = FakeRagIndexService()
+        provider = AutopilotProvider()
+        app = create_app(
+            Path(self.temp.name) / "auto-task-rag", Agent(provider), self.voice, self.mcp,
+            rag_index_service=rag,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Автопилот RAG"}).get_json()["conversation"]
+        endpoint = f"/api/conversations/{conversation['id']}"
+        changed = client.patch(f"{endpoint}/task-state", json={
+            "transition_mode": "automatic",
+            "description": "Подготовить справку по документам базы знаний о российских ПИФах.",
+            "plan": "Найти методику в документах, привести источники и цитаты, затем проверить результат.",
+        })
+        self.assertEqual(changed.status_code, 200)
+        planned = client.post(f"{endpoint}/messages", json={
+            "content": "Составь полный план", "settings": AgentSettings().to_dict(),
+            "rag": {"enabled": False},
+        })
+        self.assertEqual(planned.status_code, 200)
+        advanced = client.post(f"{endpoint}/task-state/events", json={
+            "event": "approve_plan", "automatic": True,
+        })
+        self.assertEqual(advanced.status_code, 200)
+
+        continued = client.post(f"{endpoint}/messages", json={
+            "content": "этот текст сервер должен заменить",
+            "automatic": True,
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "routing_mode": "auto",
+                "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(continued.status_code, 200)
+        messages = continued.get_json()["conversation"]["messages"]
+        auto_user, assistant = messages[-2:]
+        snapshot = assistant["technical"]["rag"]
+        self.assertTrue(auto_user["technical"]["automatic_continuation"])
+        self.assertEqual(snapshot["routing"]["route"], "rag")
+        self.assertEqual(snapshot["routing"]["classifier"], "task_policy")
+        self.assertEqual(snapshot["routing"]["reason"], "automatic_task_requires_documents")
+        self.assertTrue(snapshot["automatic_task_document_context"])
+        self.assertEqual(snapshot["retrieval_query_source"], "task_state_handoff")
+        self.assertTrue(snapshot["chunks_used_for_answer"])
+        self.assertFalse(snapshot["route_probe_only"])
+        self.assertIn("российских ПИФах", rag.retrieve_calls[0][0])
+        generation = policy_generation_calls(provider)[-1][0][0]["content"]
+        self.assertIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", generation)
+        self.assertIn("ПРОВЕРЯЕМЫЙ RAG", generation)
+
+    def test_auto_routing_keeps_strict_evidence_for_document_question(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "auto-rag", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Документы"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Что сказано в документе о точном факте?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "routing_mode": "auto",
+                "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(assistant["technical"]["rag"]["routing"]["route"], "rag")
+        self.assertTrue(assistant["technical"]["rag"]["evidence"]["valid"])
+        self.assertIn("Источники:", assistant["content"])
+        self.assertIn("Цитаты:", assistant["content"])
+
+    def test_auto_routing_does_not_fake_api_when_mcp_is_unavailable(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "auto-tools", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "API"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Получи актуальные данные через API.",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "routing_mode": "auto",
+                "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(assistant["technical"]["rag"]["routing"]["route"], "tools")
+        self.assertNotIn("Цитаты:", assistant["content"])
+        self.assertIn("Внешние данные не получены", assistant["content"])
+        generation = policy_generation_calls(provider)[0][0][0]["content"]
+        self.assertIn("АВТОМАРШРУТ ВНЕШНИХ ДАННЫХ", generation)
+        self.assertIn("доступных MCP-инструментов сейчас нет", generation)
+
+    def test_auto_routing_uses_short_classifier_only_for_ambiguous_question(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "auto-classifier", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Неоднозначный"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Составь план инвестирования.",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "routing_mode": "auto",
+                "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        routing = response.get_json()["conversation"]["visible_messages"][-1]["technical"]["rag"]["routing"]
+        self.assertEqual(routing["route"], "rag")
+        self.assertEqual(routing["classifier"], "deepseek")
+        classifier_calls = [
+            call for call in provider.calls
+            if "маршрутизатор production-like чата" in call[0][0]["content"]
+        ]
+        self.assertEqual(len(classifier_calls), 1)
+
+    def test_chat_combined_rag_rewrites_filters_and_reranks_with_separate_top_k(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "combined-rag-chat", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Улучшенный RAG"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 4, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(rag.pipeline_calls[0][2:6], ("combined", 20, 4, 0.83))
+        self.assertEqual(rag.pipeline_calls[0][-1], "Тестовый ответ")
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(assistant["technical"]["rag"]["candidate_k"], 20)
+        self.assertEqual(assistant["technical"]["rag"]["final_k"], 4)
+        self.assertEqual(assistant["technical"]["rag"]["search_query"], "Тестовый ответ")
+        self.assertIn("reranker_score", assistant["technical"]["rag"]["chunks"][0])
+
+    def test_conversational_rag_uses_clean_bounded_context_and_dual_search(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "conversational-rag", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Диалоговый RAG"}).get_json()["conversation"]
+        first = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(first.status_code, 200)
+        second = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "А чем отличается второй вариант?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 4, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(
+            rag.conversational_calls,
+            [("А чем отличается второй вариант?", "Тестовый ответ", "combined", 20, 4, 0.83, 0.7)],
+        )
+        rewrite_calls = [
+            call for call in provider.calls
+            if "семантического поиска по локальным документам" in call[0][0]["content"]
+        ]
+        contextual_prompt = rewrite_calls[-1][0][-1]["content"]
+        self.assertIn("Какой точный факт указан в документе?", contextual_prompt)
+        self.assertIn("Точный факт подтверждён документом", contextual_prompt)
+        self.assertNotIn("Источники:", contextual_prompt)
+        self.assertNotIn("Цитаты:", contextual_prompt)
+        assistant = second.get_json()["conversation"]["visible_messages"][-1]
+        snapshot = assistant["technical"]["rag"]
+        self.assertEqual(snapshot["direct_query"], "А чем отличается второй вариант?")
+        self.assertEqual(snapshot["contextual_query"], "Тестовый ответ")
+        self.assertNotIn("text", snapshot["chunks"][0])
+
+    def test_rag_evidence_cleanup_and_outside_command_detection(self):
+        answer = (
+            "Подтверждённый ответ [1].\n\n"
+            "Источники:\n1. source.pdf\n\n"
+            "Цитаты:\n1. \"Фрагмент\""
+        )
+        self.assertEqual(strip_rag_evidence_appendix(answer), "Подтверждённый ответ.")
+        self.assertTrue(requests_outside_rag("Ответь вне базы знаний: что ты знаешь?"))
+        self.assertTrue(requests_outside_rag("Используй доступные инструменты"))
+        self.assertFalse(requests_outside_rag("Не отвечай вне базы знаний"))
+        self.assertEqual(deterministic_auto_route("Что мы сейчас делаем?")["route"], "task")
+        self.assertEqual(deterministic_auto_route("Получи погоду через API")["route"], "tools")
+        self.assertEqual(deterministic_auto_route("Сопоставь данные из документа и данные через API")["route"], "hybrid")
+        self.assertEqual(deterministic_auto_route("Какие инструменты статья относит к категории 1?")["route"], "rag")
+        self.assertEqual(
+            deterministic_auto_route("Заверши записку с источниками, не добавляя неподтверждённых актуальных данных")["route"],
+            "rag",
+        )
+        self.assertIsNone(deterministic_auto_route("Составь разумный план"))
+
+    def test_explicit_outside_rag_is_one_turn_and_labeled(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "outside-rag", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Выход из RAG"}).get_json()["conversation"]
+        outside = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Ответь вне базы знаний: как называется столица Австралии?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(outside.status_code, 200)
+        outside_answer = outside.get_json()["conversation"]["visible_messages"][-1]
+        self.assertTrue(outside_answer["content"].startswith("Ответ вне локальной базы знаний."))
+        self.assertTrue(outside_answer["content"].endswith("Источники локальной базы: не использовались."))
+        self.assertTrue(outside_answer["technical"]["outside_local_rag"])
+        self.assertTrue(outside_answer["technical"]["rag"]["outside_knowledge_requested"])
+        self.assertEqual(outside_answer["technical"]["rag"]["chunks"], [])
+        self.assertEqual(rag.retrieve_calls, [])
+
+        normal = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {"enabled": True, "strategy": "combined", "mode": "baseline", "final_k": 5},
+        })
+        self.assertEqual(normal.status_code, 200)
+        self.assertEqual(rag.retrieve_calls, [("Какой точный факт указан в документе?", "combined", 5)])
+        normal_answer = normal.get_json()["conversation"]["visible_messages"][-1]
+        self.assertFalse(normal_answer["technical"]["rag"]["outside_knowledge_requested"])
+
+    def test_verified_rag_chat_returns_checked_sources_and_quotes(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "verified-rag-chat", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Проверяемый RAG"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertIn("Источники:", assistant["content"])
+        self.assertIn("Цитаты:", assistant["content"])
+        self.assertIn("source.pdf — Раздел", assistant["content"])
+        self.assertIn("chunk_id: `chunk-test`", assistant["content"])
+        self.assertTrue(assistant["technical"]["rag"]["evidence"]["valid"])
+        self.assertTrue(assistant["technical"]["rag"]["verified"])
+        self.assertEqual(assistant["technical"]["rag"]["chunks"][0]["chunk_id"], "chunk-test")
+        self.assertNotIn("text", assistant["technical"]["rag"]["chunks"][0])
+        self.assertEqual(response.get_json()["conversation"]["rag_evidence_ledger"][0]["chunk_id"], "chunk-test")
+
+    def test_synthesis_rehydrates_verified_evidence_ledger(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "rag-ledger", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Ledger"}).get_json()["conversation"]
+        options = {
+            "enabled": True, "verified": True, "strategy": "combined", "mode": "combined",
+            "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+        }
+        first = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(), "rag": options,
+        })
+        self.assertEqual(first.status_code, 200)
+        second = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Собери итоговый вывод по нашей задаче.",
+            "settings": AgentSettings().to_dict(), "rag": options,
+        })
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(rag.augment_calls[0][1], ["chunk-test"])
+        snapshot = second.get_json()["conversation"]["visible_messages"][-1]["technical"]["rag"]
+        self.assertEqual(snapshot["ledger_candidate_count"], 1)
+        self.assertTrue(snapshot["chunks"][0]["ledger_reused"])
+
+    def test_verified_rag_marks_miss_and_still_calls_deepseek(self):
+        class LowScoreRag(FakeRagIndexService):
+            def retrieve(self, query, strategy="structural", top_k=5):
+                result = super().retrieve(query, strategy, top_k)
+                result["chunks"][0]["score"] = 0.2
+                return result
+
+        rag = LowScoreRag()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "verified-rag-refusal", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Отказ RAG"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Кто победил в неизвестной игре?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertIn("В локальной базе знаний релевантная информация не найдена", assistant["content"])
+        self.assertIn("Ответ модели вне локальной базы знаний", assistant["content"])
+        rewrite_calls = [
+            call for call in provider.calls
+            if "семантического поиска по локальным документам" in call[0][0]["content"]
+        ]
+        self.assertEqual(len(rewrite_calls), 1)
+        self.assertEqual(len(policy_generation_calls(provider)), 1)
+        self.assertEqual(assistant["technical"]["rag"]["gate_phase"], "contextual_preflight")
+        self.assertFalse(assistant["technical"]["rag"]["relevance_gate_passed"])
+        self.assertFalse(assistant["technical"]["rag"]["chunks_used_for_answer"])
+        self.assertTrue(assistant["technical"]["rag"]["evidence"]["valid"])
+        self.assertEqual(assistant["technical"]["rag"]["evidence"]["status"], "general_fallback")
+
+    def test_day24_evidence_endpoint_saves_programmatic_and_llm_checks(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        data_dir = Path(self.temp.name) / "rag-day24"
+        app = create_app(data_dir, Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "День 24"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/rag-evidence-check", json={
+            "question": "Какой точный факт указан в документе?",
+            "strategy": "combined", "candidate_k": 20, "final_k": 5,
+            "similarity_threshold": 0.83, "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(response.status_code, 200)
+        evaluation = response.get_json()["evaluation"]
+        self.assertEqual(evaluation["evaluation_mode"], "day24-evidence")
+        self.assertTrue(evaluation["evidence"]["sources_present"])
+        self.assertTrue(evaluation["evidence"]["quotes_present"])
+        self.assertTrue(evaluation["semantic_evaluation"]["meaning_supported"])
+        self.assertIn("Источники:", evaluation["answer"]["content"])
+        self.assertTrue((data_dir / "rag_evaluations.json").exists())
+
+    def test_rag_comparison_uses_two_calls_and_does_not_change_dialogue(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        data_dir = Path(self.temp.name) / "rag-compare"
+        app = create_app(data_dir, Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Сравнение"}).get_json()["conversation"]
+        before = len(conversation["messages"])
+        response = client.post(f"/api/conversations/{conversation['id']}/rag-compare", json={
+            "question": "Что сказано в источнике?", "strategy": "structural", "top_k": 5,
+            "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(response.status_code, 200)
+        evaluation = response.get_json()["evaluation"]
+        self.assertEqual(evaluation["retrieval"]["chunks"][0]["chunk_id"], "chunk-test")
+        self.assertEqual(len(provider.calls), 2)
+        self.assertNotIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", provider.calls[0][0][0]["content"])
+        self.assertIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", provider.calls[1][0][0]["content"])
+        after = client.get(f"/api/conversations/{conversation['id']}").get_json()["conversation"]
+        self.assertEqual(len(after["messages"]), before)
+        evaluations = client.get("/api/rag/evaluations").get_json()["items"]
+        self.assertEqual(len(evaluations), 1)
+        self.assertTrue((data_dir / "rag_evaluations.json").exists())
+
+    def test_day23_comparison_runs_each_improvement_separately_and_combined(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        data_dir = Path(self.temp.name) / "rag-day23"
+        app = create_app(data_dir, Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "День 23"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/rag-pipeline-compare", json={
+            "question": "Какой точный факт указан в документе?",
+            "strategy": "combined", "candidate_k": 12, "final_k": 4,
+            "similarity_threshold": 0.35, "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(response.status_code, 200)
+        evaluation = response.get_json()["evaluation"]
+        self.assertEqual(set(evaluation["pipeline_results"]), {"baseline", "rewrite", "filter", "rerank", "combined"})
+        self.assertEqual(evaluation["pipeline_settings"]["candidate_k"], 12)
+        self.assertEqual(evaluation["pipeline_settings"]["final_k"], 4)
+        self.assertEqual(len(provider.calls), 6)
+        self.assertEqual([call[2] for call in rag.pipeline_calls], ["rewrite", "filter", "rerank", "combined"])
+        self.assertEqual(rag.pipeline_calls[0][-1], "Тестовый ответ")
+        self.assertIn("reranker_score", evaluation["pipeline_results"]["rerank"]["retrieval"]["chunks"][0])
 
     def test_state_exposes_model_context_windows(self):
         provider = self.client.get("/api/state").get_json()["provider"]
@@ -1165,6 +1889,124 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(unavailable.status_code, 409)
         self.assertFalse(unavailable.get_json()["mcp"]["connected"])
 
+    def test_master_mcp_switch_stops_every_server_and_blocks_restart(self):
+        data_dir = Path(self.temp.name) / "mcp-control"
+        filesystem = FakeMCPManager()
+        filesystem.running = True
+        weather = FakeWeatherMCPManager(running=True)
+        scheduler_mcp = FakeMCPManager()
+        scheduler_mcp.running = True
+        mediawiki = FakeOrchestrationMCPManager("mediawiki-test", ["search-page"], {}, running=True)
+        worldbank = FakeOrchestrationMCPManager("worldbank-test", ["worldbank_get_data"], {}, running=True)
+        app = create_app(
+            data_dir,
+            Agent(FakeProvider()),
+            self.voice,
+            filesystem,
+            weather,
+            scheduler_mcp_manager=scheduler_mcp,
+            mediawiki_mcp_manager=mediawiki,
+            worldbank_mcp_manager=worldbank,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+
+        disabled = client.post("/api/mcp-control/disable", json={})
+        self.assertEqual(disabled.status_code, 200)
+        self.assertFalse(disabled.get_json()["control"]["enabled"])
+        for manager in (filesystem, weather, scheduler_mcp, mediawiki, worldbank):
+            self.assertFalse(manager.running)
+            self.assertEqual(manager.stop_calls, 1)
+        saved = json.loads((data_dir / "mcp_control.json").read_text(encoding="utf-8"))
+        self.assertFalse(saved["enabled"])
+
+        self.assertEqual(client.post("/api/mcp/start").status_code, 409)
+        self.assertEqual(client.post("/api/weather-mcp/start").status_code, 409)
+        self.assertEqual(client.post("/api/orchestration-mcp/mediawiki/start").status_code, 409)
+        self.assertEqual(client.get("/api/scheduler/tools").status_code, 409)
+
+        restarted_mediawiki = FakeOrchestrationMCPManager("mediawiki-test", ["search-page"], {}, running=False)
+        restarted_worldbank = FakeOrchestrationMCPManager("worldbank-test", ["worldbank_get_data"], {}, running=False)
+        restarted = create_app(
+            data_dir,
+            Agent(FakeProvider()),
+            self.voice,
+            FakeMCPManager(),
+            FakeWeatherMCPManager(),
+            scheduler_mcp_manager=FakeMCPManager(),
+            mediawiki_mcp_manager=restarted_mediawiki,
+            worldbank_mcp_manager=restarted_worldbank,
+            orchestration_autostart=True,
+        )
+        restarted.config.update(TESTING=True)
+        self.assertFalse(restarted.test_client().get("/api/mcp-control").get_json()["control"]["enabled"])
+        self.assertEqual(restarted_mediawiki.start_calls, 0)
+        self.assertEqual(restarted_worldbank.start_calls, 0)
+
+        enabled = client.post("/api/mcp-control/enable", json={})
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(enabled.get_json()["control"]["enabled"])
+        self.assertFalse(filesystem.running)
+        self.assertEqual(client.post("/api/mcp/start").status_code, 200)
+        self.assertTrue(filesystem.running)
+
+    def test_master_task_switch_bypasses_lifecycle_and_persists(self):
+        data_dir = Path(self.temp.name) / "task-control"
+        provider = FakeProvider()
+        app = create_app(data_dir, Agent(provider), self.voice, FakeMCPManager())
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Обычный чат"}).get_json()["conversation"]
+        endpoint = f"/api/conversations/{conversation['id']}"
+
+        self.assertTrue(client.get("/api/task-control").get_json()["control"]["enabled"])
+        self.assertEqual(client.post(f"{endpoint}/task-state/events", json={"event": "pause"}).status_code, 200)
+        disabled = client.post("/api/task-control/disable", json={})
+        self.assertEqual(disabled.status_code, 200)
+        self.assertFalse(disabled.get_json()["control"]["enabled"])
+        self.assertFalse(json.loads((data_dir / "task_control.json").read_text(encoding="utf-8"))["enabled"])
+        self.assertEqual(client.patch(f"{endpoint}/task-state", json={"plan": "Новый план"}).status_code, 409)
+        self.assertEqual(client.post(f"{endpoint}/task-state/events", json={"event": "resume"}).status_code, 409)
+
+        sent = client.post(f"{endpoint}/messages", json={
+            "content": "Ответь как в обычном чате", "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(sent.status_code, 200)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertNotIn("ОГРАНИЧЕНИЯ КОНТРОЛИРУЕМОГО ОТВЕТА", provider.calls[0][0][0]["content"])
+        assistant = sent.get_json()["conversation"]["visible_messages"][-1]
+        self.assertFalse(assistant["technical"]["task_control"]["enabled"])
+        self.assertNotIn("policy_audit", assistant["technical"])
+        self.assertEqual(sent.get_json()["conversation"]["task_state"]["activity"], "paused")
+        self.assertEqual(client.post(f"{endpoint}/messages", json={
+            "automatic": True, "settings": AgentSettings().to_dict(),
+        }).status_code, 409)
+
+        restarted = create_app(data_dir, Agent(FakeProvider()), self.voice, FakeMCPManager())
+        restarted.config.update(TESTING=True)
+        self.assertFalse(restarted.test_client().get("/api/task-control").get_json()["control"]["enabled"])
+        self.assertTrue(client.post("/api/task-control/enable", json={}).get_json()["control"]["enabled"])
+
+    def test_disabled_master_switch_prevents_lazy_filesystem_start(self):
+        data_dir = Path(self.temp.name) / "mcp-disabled-chat"
+        workspace = data_dir / "workspace"
+        filesystem = FakeFilesystemWriteMCPManager(workspace)
+        provider = FakeProvider()
+        app = create_app(data_dir, Agent(provider), self.voice, filesystem)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        self.assertEqual(client.post("/api/mcp-control/disable", json={}).status_code, 200)
+        conversation = client.post("/api/conversations", json={"title": "Без MCP"}).get_json()["conversation"]
+
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Сохрани ответ в файл.",
+            "settings": AgentSettings().to_dict(),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(filesystem.start_calls, 0)
+        self.assertEqual(filesystem.called, [])
+
     def test_weather_mcp_has_separate_lifecycle_routes(self):
         weather = FakeWeatherMCPManager()
         app = create_app(Path(self.temp.name), Agent(self.provider), self.voice, self.mcp, weather)
@@ -1192,6 +2034,64 @@ class ApiTests(unittest.TestCase):
         self.assertIn("лёгкая куртка", assistant["content"])
         self.assertEqual(assistant["technical"]["mcp_tool_calls"][0]["name"], "get_current_weather")
         self.assertEqual(self.mcp.start_calls, 0)
+
+    def test_auto_routing_uses_connected_weather_tool_and_marks_external_source(self):
+        provider = ToolAwareFakeProvider()
+        weather = FakeWeatherMCPManager(running=True)
+        rag = FakeRagIndexService()
+        app = create_app(
+            Path(self.temp.name) / "auto-weather", Agent(provider), self.voice, self.mcp,
+            weather_mcp_manager=weather, rag_index_service=rag,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Авто-погода"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Получи актуальную погоду через API и посоветуй одежду.",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "routing_mode": "auto",
+                "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(assistant["technical"]["rag"]["routing"]["route"], "tools")
+        self.assertEqual(weather.called[0][0], "get_current_weather")
+        self.assertIn("Внешние MCP-инструменты: get_current_weather", assistant["content"])
+        self.assertNotIn("Цитаты:", assistant["content"])
+
+    def test_auto_hybrid_route_combines_document_context_and_real_tool_source(self):
+        provider = ToolAwareFakeProvider()
+        weather = FakeWeatherMCPManager(running=True)
+        rag = FakeRagIndexService()
+        app = create_app(
+            Path(self.temp.name) / "auto-hybrid", Agent(provider), self.voice, self.mcp,
+            weather_mcp_manager=weather, rag_index_service=rag,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Hybrid"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Сопоставь рекомендации из документа и актуальную погоду через API.",
+            "settings": AgentSettings().to_dict(),
+            "rag": {
+                "enabled": True, "verified": True, "routing_mode": "auto",
+                "strategy": "combined", "mode": "combined",
+                "candidate_k": 20, "final_k": 5, "similarity_threshold": 0.83,
+            },
+        })
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(assistant["technical"]["rag"]["routing"]["route"], "hybrid")
+        self.assertEqual(weather.called[0][0], "get_current_weather")
+        self.assertIn("Локальная база: source.pdf", assistant["content"])
+        self.assertIn("Внешние MCP-инструменты: get_current_weather", assistant["content"])
+        generation = policy_generation_calls(provider)[0][0][0]["content"]
+        self.assertIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", generation)
+        self.assertIn("АВТОМАРШРУТ HYBRID", generation)
+        self.assertNotIn("ПРОВЕРЯЕМЫЙ RAG", generation)
 
     def test_day20_routes_dependent_calls_across_two_mcp_servers_and_tracks_activity(self):
         mediawiki = FakeOrchestrationMCPManager(
@@ -1527,6 +2427,37 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(auto_user["technical"]["automatic_continuation"])
         self.assertTrue(auto_user["content"].startswith("[Автопилот]"))
         self.assertNotIn("подменённый текст", auto_user["content"])
+
+    def test_automatic_mode_honors_explicit_approval_of_previously_presented_plan(self):
+        self.app.extensions["chat_agent"].provider = ExplicitApprovalStallProvider()
+        conversation = self.create_conversation()
+        endpoint = f"/api/conversations/{conversation['id']}"
+        self.client.patch(f"{endpoint}/task-state", json={"transition_mode": "automatic"})
+
+        planned = self.client.post(f"{endpoint}/messages", json={
+            "content": "Подготовь план портфеля", "settings": AgentSettings().to_dict(),
+        }).get_json()["conversation"]
+        first_audit = planned["messages"][-1]["technical"]["policy_audit"]
+        self.assertEqual(first_audit["detected_action_type"], "planning")
+        self.assertFalse(first_audit["stage_complete"])
+
+        approved = self.client.post(f"{endpoint}/messages", json={
+            "content": "План утверждаю. Можешь дальше переходить.",
+            "settings": AgentSettings().to_dict(),
+        }).get_json()["conversation"]
+        audit = approved["messages"][-1]["technical"]["policy_audit"]
+        self.assertTrue(audit["stage_complete"])
+        self.assertEqual(audit["recommended_event"], "approve_plan")
+        self.assertEqual(audit["completion_source"], "explicit_user_plan_approval")
+        self.assertEqual(audit["required_artifacts"], ["portfolio.md"])
+
+        transitioned = self.client.post(f"{endpoint}/task-state/events", json={
+            "event": "approve_plan", "automatic": True,
+        })
+        self.assertEqual(transitioned.status_code, 200)
+        state = transitioned.get_json()["conversation"]["task_state"]
+        self.assertEqual(state["stage"], "execution")
+        self.assertEqual(state["required_artifacts"], ["portfolio.md"])
 
     def test_semantic_validator_blocks_implementation_during_planning(self):
         provider = MislabeledImplementationProvider()
